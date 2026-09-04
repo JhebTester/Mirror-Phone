@@ -33,7 +33,9 @@ import kotlin.concurrent.thread
  *  - Envío de paquetes al desktop por TCP.
  *
  * Protocolo (ver src-tauri/src/lib.rs):
- *   Handshake: b"MPH1" + width(u16 BE) + height(u16 BE) + fps(u16 BE)
+ *   Handshake v1: b"MPH1" + width(u16 BE) + height(u16 BE) + fps(u16 BE)
+ *   Handshake v2: b"MPH2" + pin(6 ASCII) + width(u16) + height(u16) + fps(u16)
+ *                 servidor responde 1 byte: 0x00 OK, 0x01 PIN inválido
  *   Paquete:   kind(u8) + pts_us(u64 BE) + len(u32 BE) + payload (Annex-B)
  *     kind = 0 -> CSD (SPS+PPS), 1 -> keyframe, 2 -> delta
  */
@@ -47,6 +49,7 @@ class CaptureService : Service() {
         const val EXTRA_RESULT_DATA = "resultData"
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
+        const val EXTRA_PIN = "pin"
 
         private const val CHANNEL_ID = "mirror_phone_capture"
         private const val NOTIF_ID = 101
@@ -96,6 +99,7 @@ class CaptureService : Service() {
                 else @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA)
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 7878)
+                val pin = intent.getStringExtra(EXTRA_PIN) ?: ""
                 if (data == null) { stopSelf(); return START_NOT_STICKY }
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -108,7 +112,7 @@ class CaptureService : Service() {
                     startForeground(NOTIF_ID, buildNotification("Iniciando conexión a $host:$port…"))
                 }
 
-                startMirror(code, data, host, port)
+                startMirror(code, data, host, port, pin)
             }
             ACTION_STOP -> {
                 stopMirror()
@@ -129,7 +133,7 @@ class CaptureService : Service() {
         super.onDestroy()
     }
 
-    private fun startMirror(code: Int, data: Intent, host: String, port: Int) {
+    private fun startMirror(code: Int, data: Intent, host: String, port: Int, pin: String) {
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(code, data)
         if (projection == null) {
@@ -198,15 +202,34 @@ class CaptureService : Service() {
                 s.tcpNoDelay = true
                 socket = s
                 val os: OutputStream = s.getOutputStream()
+                val ins = s.getInputStream()
                 out = DataOutputStream(os.buffered(64 * 1024))
 
-                // Handshake
-                out!!.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '1'.code.toByte()))
-                out!!.writeShort(w)
-                out!!.writeShort(h)
-                out!!.writeShort(TARGET_FPS)
-                out!!.flush()
-                Log.i(TAG, "Handshake sent successfully to $host:$port ($w x $h)")
+                // Handshake — versión 2 (con PIN) si el pin viene de 6 chars, si no legacy v1
+                if (pin.length == 6) {
+                    out!!.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '2'.code.toByte()))
+                    val pinBytes = pin.uppercase().padEnd(6, ' ')
+                        .substring(0, 6).toByteArray(Charsets.US_ASCII)
+                    out!!.write(pinBytes)
+                    out!!.writeShort(w)
+                    out!!.writeShort(h)
+                    out!!.writeShort(TARGET_FPS)
+                    out!!.flush()
+                    val ack = ins.read()
+                    if (ack != 0) {
+                        Log.e(TAG, "Servidor rechazó el PIN (ack=$ack)")
+                        running = false
+                        return@thread
+                    }
+                    Log.i(TAG, "Handshake v2 OK a $host:$port ($w x $h) con PIN")
+                } else {
+                    out!!.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '1'.code.toByte()))
+                    out!!.writeShort(w)
+                    out!!.writeShort(h)
+                    out!!.writeShort(TARGET_FPS)
+                    out!!.flush()
+                    Log.i(TAG, "Handshake v1 (legacy) a $host:$port ($w x $h)")
+                }
 
                 while (running) {
                     val pkt = sendQueue.take()

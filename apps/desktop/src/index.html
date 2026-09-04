@@ -5,6 +5,7 @@
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mirror Phone</title>
+    <script src="/vendor/qrcode.js"></script>
     <script type="module" src="/main.js" defer></script>
   </head>
   <body>
@@ -12,17 +13,30 @@
       <div class="brand">📱 Mirror Phone</div>
       <div id="status" class="status idle">Iniciando…</div>
       <div class="conn">
-        <span>Conéctate a</span>
-        <code id="ip">--</code><code>:7878</code>
+        <span id="pair-name">--</span>
       </div>
     </header>
 
     <main>
       <div class="phone-frame" id="frame">
         <canvas id="screen" width="720" height="1280"></canvas>
-        <div id="placeholder" class="placeholder">
-          <div>Esperando teléfono…</div>
-          <small>Abre la app Mirror Phone en tu Android e ingresa la IP mostrada arriba.</small>
+
+        <!-- Overlay de pairing -->
+        <div id="pairing" class="pairing">
+          <h2>Empareja tu teléfono</h2>
+          <div id="qr" class="qr"></div>
+          <div class="pin-block">
+            <span class="pin-label">PIN</span>
+            <code id="pin" class="pin">------</code>
+          </div>
+          <div class="meta-pair">
+            <div><b>Servidor</b> <span id="pair-host">--</span></div>
+            <div><b>Puerto</b> <span id="pair-port">--</span></div>
+          </div>
+          <small>
+            Abre <b>Mirror Phone Agent</b> en tu Android, toca
+            <b>Escanear QR</b> y apunta la cámara aquí.
+          </small>
         </div>
       </div>
       <div class="meta">

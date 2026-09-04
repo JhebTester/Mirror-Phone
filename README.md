@@ -1,36 +1,45 @@
-# Mirror Phone — PoC
+# Mirror Phone
 
-Espeja la pantalla de un **Android** hacia una app de escritorio **macOS** (Tauri),
-sin cables, por Wi-Fi en LAN. Este repo contiene la PoC:
+Espeja la pantalla de un **Android** hacia una app de escritorio **macOS**
+(Tauri), sin cables, por Wi-Fi en LAN. Esta versión implementa la **Fase 1**:
+descubrimiento automático y emparejamiento por QR + PIN.
 
 ```
 apps/
   desktop/   # Receptor Tauri (Rust + Vanilla JS + WebCodecs)
   android/   # Agente Android (Kotlin + MediaProjection + MediaCodec)
+scripts/
+  gen_icon.py  # Generador del ícono (Pillow)
 ```
 
-## Cómo funciona (PoC)
+## Novedades — Fase 1
 
-1. El desktop levanta un servidor TCP en `0.0.0.0:7878`.
-2. El teléfono conecta por TCP y envía handshake + stream H.264 en formato Annex-B.
-3. El backend Rust reenvía cada paquete al WebView vía evento Tauri.
-4. El WebView decodifica con `VideoDecoder` (WebCodecs) y pinta en `<canvas>`.
+- **Descubrimiento mDNS**: el Mac publica `_mirrorphone._tcp.local.` con
+  hostname y PIN.
+- **QR pairing**: el Mac muestra un QR con `{host, port, pin, name}`. El
+  teléfono lo escanea con la cámara.
+- **PIN visible** de 6 caracteres (alfabeto sin caracteres ambiguos).
+- **Lista de servidores** en el Android descubiertos por NsdManager.
+- **Handshake v2 (MPH2)** con validación de PIN.
+- **Compatibilidad legacy**: MPH1 sin PIN sigue funcionando.
 
-Protocolo (`apps/desktop/src-tauri/src/lib.rs`):
+## Cómo funciona
 
-```
-handshake: "MPH1" | width u16 BE | height u16 BE | fps u16 BE
-paquete:   kind u8 | pts u64 BE | len u32 BE | payload (Annex-B)
-           kind = 0 CSD (SPS+PPS), 1 keyframe, 2 delta
-```
+1. Mac abre TCP en `:7878` y publica mDNS con el PIN de la sesión.
+2. Frontend muestra el QR (payload JSON) + PIN en un overlay.
+3. Android escanea QR **o** elige un servidor detectado por mDNS **o** entra
+   IP+PIN manual.
+4. Android envía `MPH2 | pin(6) | w | h | fps` → servidor responde `0x00 OK` o
+   `0x01 rechazado`.
+5. Streaming H.264 en Annex-B → WebCodecs `VideoDecoder` en el WebView.
 
 ## Requisitos
 
-- **macOS** con Xcode CLT, Rust ≥ 1.77, Node ≥ 20.
-- **Android Studio Koala** o superior (para compilar el agente).
+- **macOS** con Rust ≥ 1.77, Node ≥ 20.
+- **Android Studio** con JDK 21 (viene incluido) y SDK Platform 34.
 - Teléfono Android 7.0+ (API 24+) en la **misma red Wi-Fi** que el Mac.
 
-## Correr el receptor (Tauri) en macOS
+## Correr el receptor
 
 ```bash
 cd apps/desktop
@@ -38,30 +47,36 @@ npm install
 npm run tauri dev
 ```
 
-La ventana muestra la IP local del Mac (por ejemplo `192.168.1.42`). Anótala.
+Al abrir la ventana verás el QR + el PIN. Espera al teléfono.
 
 ## Correr el agente Android
 
-1. Abre `apps/android` en Android Studio.
-2. Deja que Gradle sincronice y genere el wrapper (`gradlew`) automáticamente.
-3. Conecta un teléfono con **depuración USB** habilitada (solo para instalar; el
-   streaming va por Wi-Fi).
-4. `Run ▶` sobre el módulo `app`.
-5. En la app: escribe la IP del Mac + puerto `7878` y pulsa **Iniciar espejo**.
-   Android pedirá permiso de captura de pantalla.
+Desde Android Studio, abre `apps/android` y ejecuta el módulo `app`.
+También puedes compilar por CLI:
 
-## Ajustes rápidos
+```bash
+cd apps/android
+export ANDROID_HOME=~/Library/Android/sdk
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+./gradlew :app:assembleDebug
+# APK en app/build/outputs/apk/debug/app-debug.apk
+```
 
-- Resolución/bitrate: `CaptureService.kt` → `maxSide`, `BITRATE`, `TARGET_FPS`.
-- Puerto: constantes `7878` en `lib.rs` y `activity_main.xml`.
+En el teléfono:
+- **Escanear código QR** — apunta a la pantalla del Mac.
+- **Servidores en tu red** — toca uno de la lista.
+- **Conexión manual** — IP + puerto + PIN.
 
-## Limitaciones conocidas de esta PoC
+## Protocolo
 
-- Sin descubrimiento automático — hay que teclear la IP.
+Ver comentarios en `apps/desktop/src-tauri/src/lib.rs`.
+
+## Limitaciones actuales
+
 - Sin input inverso (solo visualización).
 - Sin audio.
-- Sin cifrado (TCP plano en LAN de confianza).
+- Sin cifrado del stream (LAN de confianza).
 - Sin reconexión automática.
-- iOS aún no soportado (planeado con `ReplayKit` Broadcast Extension).
+- iOS aún no soportado.
 
-Todo esto está en el roadmap. Ver la propuesta principal para las siguientes fases.
+Roadmap: ver propuesta de fases.
