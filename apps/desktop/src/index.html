@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mirror Phone</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">📱 Mirror Phone</div>
+      <div id="status" class="status idle">Iniciando…</div>
+      <div class="conn">
+        <span>Conéctate a</span>
+        <code id="ip">--</code><code>:7878</code>
+      </div>
+    </header>
+
+    <main>
+      <div class="phone-frame" id="frame">
+        <canvas id="screen" width="720" height="1280"></canvas>
+        <div id="placeholder" class="placeholder">
+          <div>Esperando teléfono…</div>
+          <small>Abre la app Mirror Phone en tu Android e ingresa la IP mostrada arriba.</small>
+        </div>
+      </div>
+      <div class="meta">
+        <span id="meta-res">-- x --</span>
+        <span id="meta-fps">-- fps</span>
+        <span id="meta-kbps">-- kbps</span>
+      </div>
+    </main>
+  </body>
+</html>
