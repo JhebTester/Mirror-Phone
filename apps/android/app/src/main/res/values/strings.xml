@@ -1,3 +1,26 @@
 <resources>
     <string name="app_name">Mirror Phone</string>
+    <string name="hero_subtitle">Agente • Espeja tu pantalla al Mac</string>
+
+    <string name="status_idle">Sin conectar</string>
+    <string name="status_streaming">Espejando…</string>
+    <string name="status_selected">Servidor seleccionado</string>
+    <string name="status_qr_ok">QR leído</string>
+    <string name="status_missing">Faltan datos</string>
+    <string name="status_denied">Permiso denegado</string>
+
+    <string name="qr_title">Escanear código QR</string>
+    <string name="qr_subtitle">La forma más rápida de emparejar tu Mac.</string>
+    <string name="qr_scan">Abrir cámara</string>
+
+    <string name="servers_title">Servidores en tu red</string>
+    <string name="servers_empty">Buscando en tu red Wi-Fi…</string>
+
+    <string name="manual_title">Conexión manual</string>
+    <string name="manual_ip_hint">IP del Mac (192.168.1.42)</string>
+    <string name="manual_port_hint">Puerto</string>
+    <string name="manual_pin_hint">PIN (6 caracteres)</string>
+
+    <string name="action_start">Iniciar espejo</string>
+    <string name="action_stop">Detener</string>
 </resources>

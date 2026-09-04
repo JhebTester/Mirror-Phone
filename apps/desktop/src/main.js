@@ -54,6 +54,62 @@ function codecStringFromSPS(spsBytes) {
   return `avc1.${p}${c}${l}`.toUpperCase();
 }
 
+// Build an AVCC (avcC) description box from the CSD Annex-B (SPS+PPS).
+// This lets us configure VideoDecoder in "avc" (length-prefixed) mode which is
+// what WKWebView WebCodecs actually accepts.
+function buildAvcCDescription(sps, pps) {
+  // avcC layout:
+  //  1 byte  configurationVersion (0x01)
+  //  1 byte  AVCProfileIndication
+  //  1 byte  profile_compatibility
+  //  1 byte  AVCLevelIndication
+  //  1 byte  0xFC | (lengthSizeMinusOne=3)  -> 0xFF
+  //  1 byte  0xE0 | numOfSPS               -> 0xE1
+  //  2 bytes SPS length
+  //  N bytes SPS
+  //  1 byte  numOfPPS                      -> 0x01
+  //  2 bytes PPS length
+  //  N bytes PPS
+  const total = 5 + 1 + 2 + sps.length + 1 + 2 + pps.length;
+  const out = new Uint8Array(total);
+  let o = 0;
+  out[o++] = 0x01;
+  out[o++] = sps[1];
+  out[o++] = sps[2];
+  out[o++] = sps[3];
+  out[o++] = 0xff;
+  out[o++] = 0xe1;
+  out[o++] = (sps.length >> 8) & 0xff;
+  out[o++] = sps.length & 0xff;
+  out.set(sps, o); o += sps.length;
+  out[o++] = 0x01;
+  out[o++] = (pps.length >> 8) & 0xff;
+  out[o++] = pps.length & 0xff;
+  out.set(pps, o);
+  return out;
+}
+
+// Convert an Annex-B buffer (may contain multiple NALs) to length-prefixed AVCC
+// format (4-byte BE length + NAL for each unit).
+function annexBtoAvcc(annexB) {
+  const nals = [];
+  let total = 0;
+  for (const nal of iterateAnnexB(annexB)) {
+    nals.push(nal);
+    total += 4 + nal.length;
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const nal of nals) {
+    out[o++] = (nal.length >>> 24) & 0xff;
+    out[o++] = (nal.length >>> 16) & 0xff;
+    out[o++] = (nal.length >>> 8) & 0xff;
+    out[o++] = nal.length & 0xff;
+    out.set(nal, o); o += nal.length;
+  }
+  return out;
+}
+
 function* iterateAnnexB(buf) {
   let i = 0;
   const len = buf.length;
@@ -82,12 +138,64 @@ function b64ToBytes(b64) {
 }
 
 async function ensureDecoder(csdBytes) {
-  let sps = null;
+  let sps = null, pps = null;
   for (const nal of iterateAnnexB(csdBytes)) {
-    if (nal.length && (nal[0] & 0x1f) === 7) sps = nal;
+    if (!nal.length) continue;
+    const t = nal[0] & 0x1f;
+    if (t === 7) sps = nal;
+    else if (t === 8) pps = nal;
   }
-  if (!sps) return;
-  const codec = codecStringFromSPS(sps);
+  if (!sps || !pps) {
+    console.warn("CSD sin SPS+PPS, esperando…");
+    return;
+  }
+
+  const detected = codecStringFromSPS(sps);
+  const description = buildAvcCDescription(sps, pps);
+
+  // Lista de intentos: primero el codec detectado, luego fallbacks comunes.
+  const candidates = [
+    detected,
+    "avc1.42E01E", // Baseline L3.0
+    "avc1.42E01F", // Baseline L3.1
+    "avc1.4D401E", // Main L3.0
+    "avc1.4D401F", // Main L3.1
+    "avc1.640028", // High L4.0
+  ];
+  // Deduplicar preservando orden
+  const seen = new Set();
+  const uniq = candidates.filter((c) => (seen.has(c) ? false : (seen.add(c), true)));
+
+  let chosen = null;
+  let chosenConfig = null;
+  for (const codec of uniq) {
+    for (const withDesc of [true, false]) {
+      const cfg = { codec, optimizeForLatency: true };
+      if (withDesc) cfg.description = description;
+      try {
+        const res = await VideoDecoder.isConfigSupported(cfg);
+        if (res.supported) {
+          chosen = codec;
+          chosenConfig = cfg;
+          break;
+        }
+      } catch (e) {
+        // sigue probando
+      }
+    }
+    if (chosen) break;
+  }
+
+  if (!chosen) {
+    console.error("Ningún codec H.264 aceptado. Detectado:", detected);
+    setStatus("error", `Codec no soportado (detectado ${detected})`);
+    return;
+  }
+  console.log(
+    "VideoDecoder OK con",
+    chosen,
+    chosenConfig.description ? "(con avcC description)" : "(annex-b)"
+  );
 
   if (decoder) {
     try { decoder.close(); } catch {}
@@ -110,8 +218,9 @@ async function ensureDecoder(csdBytes) {
   });
 
   try {
-    decoder.configure({ codec, optimizeForLatency: true });
-    console.log("VideoDecoder configurado:", codec);
+    decoder.configure(chosenConfig);
+    // Guarda si estamos en modo AVCC (length-prefixed) para los siguientes chunks.
+    decoder._avccMode = !!chosenConfig.description;
   } catch (e) {
     console.error("configure failed", e);
     setStatus("error", `configure: ${e.message}`);
@@ -128,10 +237,13 @@ async function onPacket({ kind, pts_us, b64 }) {
   }
   if (!decoder || decoder.state !== "configured") return;
 
+  // Si configuramos en modo AVCC (length-prefixed), convierte Annex-B → AVCC
+  const payload = decoder._avccMode ? annexBtoAvcc(bytes) : bytes;
+
   const chunk = new EncodedVideoChunk({
     type: kind === 1 ? "key" : "delta",
     timestamp: Number(pts_us),
-    data: bytes,
+    data: payload,
   });
   try {
     decoder.decode(chunk);

@@ -24,6 +24,8 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
@@ -53,8 +55,8 @@ class CaptureService : Service() {
 
         private const val CHANNEL_ID = "mirror_phone_capture"
         private const val NOTIF_ID = 101
-
-        // Ajustes de encoding
+        private const val REQ_STOP = 1
+        private const val REQ_OPEN = 2
         private const val TARGET_FPS = 30
         private const val BITRATE = 4_000_000 // 4 Mbps
         private const val IFRAME_INTERVAL_SEC = 2
@@ -65,24 +67,18 @@ class CaptureService : Service() {
     private var encoder: MediaCodec? = null
     private var inputSurface: Surface? = null
 
-    private var socket: Socket? = null
-    private var out: DataOutputStream? = null
+    @Volatile private var socket: Socket? = null
+    @Volatile private var out: DataOutputStream? = null
     private val sendQueue = LinkedBlockingQueue<Packet>()
     @Volatile private var running = false
+    private val stopping = AtomicBoolean(false)
     private var senderThread: Thread? = null
     private var drainThread: Thread? = null
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             Log.i(TAG, "MediaProjection stopped by system")
-            stopMirror()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            stopSelf()
+            fullStopAndExit()
         }
     }
 
@@ -102,47 +98,106 @@ class CaptureService : Service() {
                 val pin = intent.getStringExtra(EXTRA_PIN) ?: ""
                 if (data == null) { stopSelf(); return START_NOT_STICKY }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        NOTIF_ID,
-                        buildNotification("Iniciando conexión a $host:$port…"),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    )
-                } else {
-                    startForeground(NOTIF_ID, buildNotification("Iniciando conexión a $host:$port…"))
-                }
-
+                startForegroundWithType("Iniciando conexión a $host:$port…")
                 startMirror(code, data, host, port, pin)
             }
             ACTION_STOP -> {
-                stopMirror()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    stopForeground(true)
-                }
-                stopSelf()
+                Log.i(TAG, "ACTION_STOP recibido")
+                fullStopAndExit()
             }
         }
         return START_NOT_STICKY
     }
 
+    /** Si el usuario cierra la app deslizándola de recientes, detenemos el servicio.
+     *  (El sistema llama a onTaskRemoved cuando se remueve la tarea principal.) */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(TAG, "onTaskRemoved: app cerrada, deteniendo mirror")
+        fullStopAndExit()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
+        // Doble seguro por si el sistema mata el servicio sin pasar por ACTION_STOP
         stopMirror()
         super.onDestroy()
     }
+
+    // ---------------------------------------------------------------- notifs
+
+    private fun startForegroundWithType(text: String) {
+        val n = buildNotification(text)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(NOTIF_ID, n)
+        }
+    }
+
+    private fun updateNotification(text: String) {
+        try {
+            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            mgr.notify(NOTIF_ID, buildNotification(text))
+        } catch (_: Exception) {}
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26 && mgr.getNotificationChannel(CHANNEL_ID) == null) {
+            mgr.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Mirror Phone", NotificationManager.IMPORTANCE_LOW).apply {
+                    setShowBadge(false)
+                }
+            )
+        }
+
+        val flagImmutable =
+            if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0
+
+        // Botón "Detener": envía ACTION_STOP al servicio
+        val stopIntent = Intent(this, CaptureService::class.java).apply { action = ACTION_STOP }
+        val stopPi = PendingIntent.getService(
+            this, REQ_STOP, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or flagImmutable
+        )
+
+        // Tap sobre la notificación: abre MainActivity
+        val openPi = PendingIntent.getActivity(
+            this, REQ_OPEN,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or flagImmutable
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Mirror Phone activo")
+            .setContentText(text)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setColor(0xFF14B8A6.toInt())
+            .setColorized(true)
+            .setOngoing(true)
+            .setContentIntent(openPi)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Detener",
+                stopPi
+            )
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
+    }
+
+    // ---------------------------------------------------------------- start
 
     private fun startMirror(code: Int, data: Intent, host: String, port: Int, pin: String) {
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(code, data)
         if (projection == null) {
             Log.e(TAG, "Failed to obtain MediaProjection")
-            stopSelf()
+            fullStopAndExit()
             return
         }
-
-        // Registrar callback requerido a partir de Android 14 (API 34)
         projection!!.registerCallback(projectionCallback, null)
 
         val (srcW, srcH, dpi) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -157,7 +212,6 @@ class CaptureService : Service() {
             Triple(metrics.widthPixels, metrics.heightPixels, metrics.densityDpi)
         }
 
-        // Escalado para mantener ancho de banda razonable y alineación exacta a 16 px (macrobloques H.264)
         val maxSide = 1280
         val scale = minOf(1f, maxSide.toFloat() / maxOf(srcW, srcH).toFloat())
         val w = (((srcW * scale).toInt() + 15) / 16) * 16
@@ -171,7 +225,7 @@ class CaptureService : Service() {
             setInteger(MediaFormat.KEY_FRAME_RATE, TARGET_FPS)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, IFRAME_INTERVAL_SEC)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            // Baseline profile Level 4.1 para compatibilidad universal con WebCodecs en resoluciones HD
+            // Baseline profile Level 4.1 para compatibilidad universal con WebCodecs
             if (Build.VERSION.SDK_INT >= 21) {
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
                 setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
@@ -193,72 +247,91 @@ class CaptureService : Service() {
 
         running = true
 
-        // Sender: conexión TCP + handshake + envío de paquetes
-        senderThread = thread(name = "sender") {
+        // Sender: conexión TCP + handshake + envío de paquetes (v0.1.0 — sin drops)
+        senderThread = thread(name = "sender", isDaemon = true) {
             try {
                 Log.i(TAG, "Connecting to $host:$port...")
                 val s = Socket()
                 s.connect(InetSocketAddress(host, port), 5000)
                 s.tcpNoDelay = true
+                // Al cerrar, no esperar más de 1s por buffers pendientes
+                s.setSoLinger(true, 1)
                 socket = s
                 val os: OutputStream = s.getOutputStream()
                 val ins = s.getInputStream()
-                out = DataOutputStream(os.buffered(64 * 1024))
+                val dos = DataOutputStream(os.buffered(64 * 1024))
+                out = dos
 
-                // Handshake — versión 2 (con PIN) si el pin viene de 6 chars, si no legacy v1
                 if (pin.length == 6) {
-                    out!!.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '2'.code.toByte()))
+                    dos.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '2'.code.toByte()))
                     val pinBytes = pin.uppercase().padEnd(6, ' ')
                         .substring(0, 6).toByteArray(Charsets.US_ASCII)
-                    out!!.write(pinBytes)
-                    out!!.writeShort(w)
-                    out!!.writeShort(h)
-                    out!!.writeShort(TARGET_FPS)
-                    out!!.flush()
+                    dos.write(pinBytes)
+                    dos.writeShort(w)
+                    dos.writeShort(h)
+                    dos.writeShort(TARGET_FPS)
+                    dos.flush()
                     val ack = ins.read()
                     if (ack != 0) {
                         Log.e(TAG, "Servidor rechazó el PIN (ack=$ack)")
-                        running = false
+                        runOnMainSafe { updateNotification("PIN inválido. Detenido.") }
+                        fullStopAndExit()
                         return@thread
                     }
                     Log.i(TAG, "Handshake v2 OK a $host:$port ($w x $h) con PIN")
                 } else {
-                    out!!.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '1'.code.toByte()))
-                    out!!.writeShort(w)
-                    out!!.writeShort(h)
-                    out!!.writeShort(TARGET_FPS)
-                    out!!.flush()
+                    dos.write(byteArrayOf('M'.code.toByte(), 'P'.code.toByte(), 'H'.code.toByte(), '1'.code.toByte()))
+                    dos.writeShort(w)
+                    dos.writeShort(h)
+                    dos.writeShort(TARGET_FPS)
+                    dos.flush()
                     Log.i(TAG, "Handshake v1 (legacy) a $host:$port ($w x $h)")
                 }
 
+                updateNotification("Espejando a $host:$port")
+
+                // Bucle de envío con poll para poder salir rápido cuando running=false
                 while (running) {
-                    val pkt = sendQueue.take()
-                    out!!.writeByte(pkt.kind.toInt())
-                    out!!.writeLong(pkt.ptsUs)
-                    out!!.writeInt(pkt.data.size)
-                    out!!.write(pkt.data)
-                    out!!.flush()
+                    val pkt = sendQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                    dos.writeByte(pkt.kind.toInt())
+                    dos.writeLong(pkt.ptsUs)
+                    dos.writeInt(pkt.data.size)
+                    dos.write(pkt.data)
+                    dos.flush()
                 }
+                Log.i(TAG, "Sender loop terminó (running=false)")
+            } catch (e: InterruptedException) {
+                Log.i(TAG, "Sender interrumpido")
             } catch (e: Exception) {
-                Log.e(TAG, "Sender connection error to $host:$port: ${e.message}", e)
-                running = false
+                if (running) {
+                    Log.e(TAG, "Sender connection error to $host:$port: ${e.message}", e)
+                    runOnMainSafe { updateNotification("Conexión perdida. Detenido.") }
+                    fullStopAndExit()
+                } else {
+                    Log.i(TAG, "Sender terminó durante shutdown: ${e.message}")
+                }
             }
         }
 
-        // Drain: leer buffers del encoder y encolar
-        drainThread = thread(name = "drain") {
+        // Drain: leer buffers del encoder y encolar (v0.1.0 — cola ilimitada, sin drops)
+        drainThread = thread(name = "drain", isDaemon = true) {
             val info = MediaCodec.BufferInfo()
             var csd: ByteArray? = null
             while (running) {
-                val idx = try { encoder!!.dequeueOutputBuffer(info, 10_000) } catch (e: Exception) {
-                    Log.e(TAG, "dequeue error", e); break
+                val idx = try {
+                    encoder?.dequeueOutputBuffer(info, 10_000) ?: break
+                } catch (e: Exception) {
+                    if (running) Log.e(TAG, "dequeue error", e)
+                    break
                 }
                 if (idx < 0) continue
-                val buf: ByteBuffer = encoder!!.getOutputBuffer(idx) ?: continue
+                val buf: ByteBuffer = try {
+                    encoder?.getOutputBuffer(idx) ?: continue
+                } catch (_: Exception) { continue }
                 buf.position(info.offset)
                 buf.limit(info.offset + info.size)
                 val bytes = ByteArray(info.size).also { buf.get(it) }
-                encoder!!.releaseOutputBuffer(idx, false)
+                try { encoder?.releaseOutputBuffer(idx, false) } catch (_: Exception) {}
 
                 val isCfg = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                 val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
@@ -267,50 +340,71 @@ class CaptureService : Service() {
                     sendQueue.offer(Packet(0, info.presentationTimeUs, bytes))
                 } else {
                     if (isKey && csd != null) {
-                        // Reenvía CSD antes del keyframe (seguridad si el cliente reconecta)
                         sendQueue.offer(Packet(0, info.presentationTimeUs, csd!!))
                     }
-                    sendQueue.offer(
-                        Packet(if (isKey) 1 else 2, info.presentationTimeUs, bytes)
-                    )
+                    sendQueue.offer(Packet(if (isKey) 1 else 2, info.presentationTimeUs, bytes))
                 }
                 if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
             }
+            Log.i(TAG, "Drain loop terminó")
         }
+    }
+
+    /** Pide al encoder un sync frame en el próximo cuadro. Útil tras drops
+     *  para recuperar rápido sin esperar al I-frame periódico. */
+    private fun requestSyncFrame() {
+        try {
+            val params = android.os.Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            encoder?.setParameters(params)
+        } catch (_: Exception) {}
+    }
+
+    // ---------------------------------------------------------------- stop
+
+    /** Detiene TODO y sale del foreground. Reentrante-seguro. */
+    private fun fullStopAndExit() {
+        if (!stopping.compareAndSet(false, true)) return
+        stopMirror()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (_: Exception) {}
+        stopSelf()
     }
 
     private fun stopMirror() {
         running = false
+        // 1. Cierra socket primero — desbloquea cualquier write bloqueante
+        try { socket?.close() } catch (_: Exception) {}
+        socket = null
+        out = null
+
+        // 2. Poison + interrupt para desbloquear take()/poll()
         try { sendQueue.clear() } catch (_: Exception) {}
-        try { drainThread?.interrupt() } catch (_: Exception) {}
         try { senderThread?.interrupt() } catch (_: Exception) {}
+        try { drainThread?.interrupt() } catch (_: Exception) {}
+
+        // 3. Encoder y virtual display
         try { encoder?.stop() } catch (_: Exception) {}
         try { encoder?.release() } catch (_: Exception) {}
         encoder = null
         try { virtualDisplay?.release() } catch (_: Exception) {}
         virtualDisplay = null
-        try {
-            projection?.unregisterCallback(projectionCallback)
-            projection?.stop()
-        } catch (_: Exception) {}
+        try { inputSurface?.release() } catch (_: Exception) {}
+        inputSurface = null
+
+        // 4. Proyección (después del display para que no dispare callback re-entrante)
+        try { projection?.unregisterCallback(projectionCallback) } catch (_: Exception) {}
+        try { projection?.stop() } catch (_: Exception) {}
         projection = null
-        try { socket?.close() } catch (_: Exception) {}
-        socket = null
-        out = null
     }
 
-    private fun buildNotification(text: String): Notification {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= 26 && mgr.getNotificationChannel(CHANNEL_ID) == null) {
-            mgr.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Mirror Phone", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Mirror Phone activo")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setOngoing(true)
-            .build()
+    private fun runOnMainSafe(block: () -> Unit) {
+        try { android.os.Handler(mainLooper).post(block) } catch (_: Exception) {}
     }
 }
