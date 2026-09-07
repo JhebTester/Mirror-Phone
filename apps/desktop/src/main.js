@@ -1,8 +1,17 @@
+// Mirror Phone — Desktop receiver (WebRTC edition)
+//
+// El agente Android es el offerer. Nosotros somos el answerer:
+//   1) Rust nos entrega mensajes de signaling desde el phone via evento
+//      "mirror://signaling" con { kind, text }, donde kind es:
+//        0x10 = SDP offer, 0x11 = SDP answer, 0x12 = ICE candidate, 0x13 = bye
+//   2) Nosotros respondemos usando el comando `send_signaling(kind, text)`.
+//   3) Una vez negociado, el video llega directo por UDP al elemento <video>.
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const statusEl = document.getElementById("status");
-const canvas = document.getElementById("screen");
+const video = document.getElementById("screen");
 const pairing = document.getElementById("pairing");
 const qrEl = document.getElementById("qr");
 const pinEl = document.getElementById("pin");
@@ -12,11 +21,14 @@ const pairName = document.getElementById("pair-name");
 const metaRes = document.getElementById("meta-res");
 const metaFps = document.getElementById("meta-fps");
 const metaKbps = document.getElementById("meta-kbps");
-const ctx = canvas.getContext("2d");
 
-let decoder = null;
-let bytesInWindow = 0;
-let framesInWindow = 0;
+const KIND_OFFER = 0x10;
+const KIND_ANSWER = 0x11;
+const KIND_ICE = 0x12;
+const KIND_BYE = 0x13;
+
+let pc = null;
+let statsTimer = null;
 
 function setStatus(state, message) {
   statusEl.className = `status ${state}`;
@@ -24,11 +36,9 @@ function setStatus(state, message) {
 }
 
 function renderQR(payload) {
-  // qrcode-generator: type=0 (auto), 'M' error correction
   const qr = window.qrcode(0, "M");
   qr.addData(payload);
   qr.make();
-  // createImgTag(cellSize, margin)
   qrEl.innerHTML = qr.createImgTag(6, 8);
 }
 
@@ -42,246 +52,163 @@ async function loadPairing() {
     renderQR(info.qr_payload);
   } catch (e) {
     console.warn("get_pairing_info falló:", e);
-    // Reintenta cuando llegue la IP (setup async)
     setTimeout(loadPairing, 1000);
   }
 }
 
-function codecStringFromSPS(spsBytes) {
-  const p = spsBytes[1].toString(16).padStart(2, "0");
-  const c = spsBytes[2].toString(16).padStart(2, "0");
-  const l = spsBytes[3].toString(16).padStart(2, "0");
-  return `avc1.${p}${c}${l}`.toUpperCase();
-}
-
-// Build an AVCC (avcC) description box from the CSD Annex-B (SPS+PPS).
-// This lets us configure VideoDecoder in "avc" (length-prefixed) mode which is
-// what WKWebView WebCodecs actually accepts.
-function buildAvcCDescription(sps, pps) {
-  // avcC layout:
-  //  1 byte  configurationVersion (0x01)
-  //  1 byte  AVCProfileIndication
-  //  1 byte  profile_compatibility
-  //  1 byte  AVCLevelIndication
-  //  1 byte  0xFC | (lengthSizeMinusOne=3)  -> 0xFF
-  //  1 byte  0xE0 | numOfSPS               -> 0xE1
-  //  2 bytes SPS length
-  //  N bytes SPS
-  //  1 byte  numOfPPS                      -> 0x01
-  //  2 bytes PPS length
-  //  N bytes PPS
-  const total = 5 + 1 + 2 + sps.length + 1 + 2 + pps.length;
-  const out = new Uint8Array(total);
-  let o = 0;
-  out[o++] = 0x01;
-  out[o++] = sps[1];
-  out[o++] = sps[2];
-  out[o++] = sps[3];
-  out[o++] = 0xff;
-  out[o++] = 0xe1;
-  out[o++] = (sps.length >> 8) & 0xff;
-  out[o++] = sps.length & 0xff;
-  out.set(sps, o); o += sps.length;
-  out[o++] = 0x01;
-  out[o++] = (pps.length >> 8) & 0xff;
-  out[o++] = pps.length & 0xff;
-  out.set(pps, o);
-  return out;
-}
-
-// Convert an Annex-B buffer (may contain multiple NALs) to length-prefixed AVCC
-// format (4-byte BE length + NAL for each unit).
-function annexBtoAvcc(annexB) {
-  const nals = [];
-  let total = 0;
-  for (const nal of iterateAnnexB(annexB)) {
-    nals.push(nal);
-    total += 4 + nal.length;
+async function sendSignaling(kind, text) {
+  try {
+    await invoke("send_signaling", { kind, text });
+  } catch (e) {
+    console.error("send_signaling failed", e);
   }
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const nal of nals) {
-    out[o++] = (nal.length >>> 24) & 0xff;
-    out[o++] = (nal.length >>> 16) & 0xff;
-    out[o++] = (nal.length >>> 8) & 0xff;
-    out[o++] = nal.length & 0xff;
-    out.set(nal, o); o += nal.length;
-  }
-  return out;
 }
 
-function* iterateAnnexB(buf) {
-  let i = 0;
-  const len = buf.length;
-  let start = -1;
-  while (i < len - 3) {
-    const isSC3 = buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1;
-    const isSC4 =
-      buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 0 && buf[i + 3] === 1;
-    if (isSC3 || isSC4) {
-      const scLen = isSC4 ? 4 : 3;
-      if (start >= 0) yield buf.subarray(start, i);
-      start = i + scLen;
-      i += scLen;
+function closePeer() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (pc) {
+    try { pc.close(); } catch {}
+    pc = null;
+  }
+  try { video.srcObject = null; } catch {}
+  pairing.classList.remove("hidden");
+}
+
+async function createPeerAnswerer() {
+  closePeer();
+
+  // Sin servidores ICE — mismo LAN → candidatos host bastan
+  pc = new RTCPeerConnection({ iceServers: [] });
+
+  pc.addEventListener("track", (ev) => {
+    console.log("ontrack", ev.track.kind);
+    // Reduce el jitter buffer del receptor al mínimo (LAN → latencia ~0).
+    // WKWebView Safari 16+ soporta playoutDelayHint en RTCRtpReceiver.
+    try {
+      if ("playoutDelayHint" in ev.receiver) {
+        ev.receiver.playoutDelayHint = 0;
+      }
+      if ("jitterBufferTarget" in ev.receiver) {
+        ev.receiver.jitterBufferTarget = 0;
+      }
+    } catch (e) { console.warn("playoutDelayHint no soportado:", e); }
+    if (ev.streams && ev.streams[0]) {
+      video.srcObject = ev.streams[0];
     } else {
-      i++;
+      const stream = new MediaStream([ev.track]);
+      video.srcObject = stream;
     }
-  }
-  if (start >= 0) yield buf.subarray(start, len);
-}
-
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-async function ensureDecoder(csdBytes) {
-  let sps = null, pps = null;
-  for (const nal of iterateAnnexB(csdBytes)) {
-    if (!nal.length) continue;
-    const t = nal[0] & 0x1f;
-    if (t === 7) sps = nal;
-    else if (t === 8) pps = nal;
-  }
-  if (!sps || !pps) {
-    console.warn("CSD sin SPS+PPS, esperando…");
-    return;
-  }
-
-  const detected = codecStringFromSPS(sps);
-  const description = buildAvcCDescription(sps, pps);
-
-  // Lista de intentos: primero el codec detectado, luego fallbacks comunes.
-  const candidates = [
-    detected,
-    "avc1.42E01E", // Baseline L3.0
-    "avc1.42E01F", // Baseline L3.1
-    "avc1.4D401E", // Main L3.0
-    "avc1.4D401F", // Main L3.1
-    "avc1.640028", // High L4.0
-  ];
-  // Deduplicar preservando orden
-  const seen = new Set();
-  const uniq = candidates.filter((c) => (seen.has(c) ? false : (seen.add(c), true)));
-
-  let chosen = null;
-  let chosenConfig = null;
-  for (const codec of uniq) {
-    for (const withDesc of [true, false]) {
-      const cfg = { codec, optimizeForLatency: true };
-      if (withDesc) cfg.description = description;
-      try {
-        const res = await VideoDecoder.isConfigSupported(cfg);
-        if (res.supported) {
-          chosen = codec;
-          chosenConfig = cfg;
-          break;
-        }
-      } catch (e) {
-        // sigue probando
-      }
-    }
-    if (chosen) break;
-  }
-
-  if (!chosen) {
-    console.error("Ningún codec H.264 aceptado. Detectado:", detected);
-    setStatus("error", `Codec no soportado (detectado ${detected})`);
-    return;
-  }
-  console.log(
-    "VideoDecoder OK con",
-    chosen,
-    chosenConfig.description ? "(con avcC description)" : "(annex-b)"
-  );
-
-  if (decoder) {
-    try { decoder.close(); } catch {}
-  }
-  decoder = new VideoDecoder({
-    output: (frame) => {
-      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-        canvas.width = frame.displayWidth;
-        canvas.height = frame.displayHeight;
-      }
-      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-      frame.close();
-      framesInWindow++;
-      pairing.classList.add("hidden");
-    },
-    error: (e) => {
-      console.error("decoder error", e);
-      setStatus("error", `Decoder: ${e.message}`);
-    },
+    pairing.classList.add("hidden");
   });
 
-  try {
-    decoder.configure(chosenConfig);
-    // Guarda si estamos en modo AVCC (length-prefixed) para los siguientes chunks.
-    decoder._avccMode = !!chosenConfig.description;
-  } catch (e) {
-    console.error("configure failed", e);
-    setStatus("error", `configure: ${e.message}`);
-  }
-}
-
-async function onPacket({ kind, pts_us, b64 }) {
-  const bytes = b64ToBytes(b64);
-  bytesInWindow += bytes.length;
-
-  if (kind === 0) {
-    await ensureDecoder(bytes);
-    return;
-  }
-  if (!decoder || decoder.state !== "configured") return;
-
-  // Si configuramos en modo AVCC (length-prefixed), convierte Annex-B → AVCC
-  const payload = decoder._avccMode ? annexBtoAvcc(bytes) : bytes;
-
-  const chunk = new EncodedVideoChunk({
-    type: kind === 1 ? "key" : "delta",
-    timestamp: Number(pts_us),
-    data: payload,
+  pc.addEventListener("icecandidate", (ev) => {
+    if (ev.candidate) {
+      sendSignaling(KIND_ICE, JSON.stringify({
+        candidate: ev.candidate.candidate,
+        sdpMid: ev.candidate.sdpMid,
+        sdpMLineIndex: ev.candidate.sdpMLineIndex,
+      }));
+    } else {
+      // Fin del gathering — no hace falta enviar nada
+    }
   });
+
+  pc.addEventListener("connectionstatechange", () => {
+    console.log("pc state:", pc?.connectionState);
+    if (!pc) return;
+    if (pc.connectionState === "connected") {
+      setStatus("connected", "Espejando (WebRTC conectado)");
+    } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+      setStatus("disconnected", "Conexión perdida");
+      closePeer();
+    }
+  });
+
+  // Video metrics (resolución + fps + bitrate) desde getStats
+  statsTimer = setInterval(refreshStats, 1000);
+}
+
+let lastBytes = 0;
+let lastFramesDecoded = 0;
+let lastStatsTs = 0;
+
+async function refreshStats() {
+  if (!pc) return;
   try {
-    decoder.decode(chunk);
+    const stats = await pc.getStats();
+    let inbound = null;
+    for (const s of stats.values()) {
+      if (s.type === "inbound-rtp" && s.kind === "video") { inbound = s; break; }
+    }
+    if (!inbound) return;
+
+    const now = performance.now();
+    const dt = lastStatsTs ? (now - lastStatsTs) / 1000 : 1;
+    lastStatsTs = now;
+
+    const bytes = inbound.bytesReceived || 0;
+    const framesDecoded = inbound.framesDecoded || 0;
+    const deltaBytes = Math.max(0, bytes - lastBytes);
+    const deltaFrames = Math.max(0, framesDecoded - lastFramesDecoded);
+    lastBytes = bytes;
+    lastFramesDecoded = framesDecoded;
+
+    const kbps = Math.round((deltaBytes * 8) / 1000 / dt);
+    const fps = Math.round(deltaFrames / dt);
+    metaKbps.textContent = `${kbps} kbps`;
+    metaFps.textContent = `${fps} fps`;
+    if (inbound.frameWidth && inbound.frameHeight) {
+      metaRes.textContent = `${inbound.frameWidth} × ${inbound.frameHeight}`;
+    }
   } catch (e) {
-    console.error("decode failed", e);
+    // stats podría fallar si la conexión aún no está lista
   }
 }
 
-setInterval(() => {
-  const kbps = ((bytesInWindow * 8) / 1000).toFixed(0);
-  metaKbps.textContent = `${kbps} kbps`;
-  metaFps.textContent = `${framesInWindow} fps`;
-  bytesInWindow = 0;
-  framesInWindow = 0;
-}, 1000);
+async function handleSignaling({ kind, text }) {
+  try {
+    if (kind === KIND_OFFER) {
+      const offer = JSON.parse(text);
+      await createPeerAnswerer();
+      await pc.setRemoteDescription({ type: "offer", sdp: offer.sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await sendSignaling(KIND_ANSWER, JSON.stringify({ sdp: answer.sdp }));
+      setStatus("connecting", "Negociando…");
+    } else if (kind === KIND_ICE) {
+      if (!pc) return;
+      const ice = JSON.parse(text);
+      await pc.addIceCandidate(ice);
+    } else if (kind === KIND_BYE) {
+      setStatus("disconnected", "Teléfono desconectado");
+      closePeer();
+    }
+  } catch (e) {
+    console.error("signaling error", e);
+    setStatus("error", `signaling: ${e.message}`);
+  }
+}
 
 (async () => {
-  if (!("VideoDecoder" in window)) {
-    setStatus("error", "WebCodecs no soportado en este WebView");
+  if (!("RTCPeerConnection" in window)) {
+    setStatus("error", "WebRTC no soportado en este WebView");
     return;
   }
   setStatus("listening", "Esperando teléfono…");
   await loadPairing();
 
-  await listen("mirror://status", (e) => {
-    const { state, message } = e.payload;
+  await listen("mirror://status", (ev) => {
+    const { state, message } = ev.payload;
     setStatus(state, message);
-    if (state === "disconnected") {
-      pairing.classList.remove("hidden");
-      if (decoder) { try { decoder.close(); } catch {} decoder = null; }
-    }
   });
 
-  await listen("mirror://handshake", (e) => {
-    const hs = e.payload;
-    metaRes.textContent = `${hs.width} x ${hs.height}`;
-    setStatus("connected", `Conectado ${hs.peer}`);
+  await listen("mirror://handshake", (ev) => {
+    const { width, height, fps, peer } = ev.payload;
+    console.log("handshake", width, height, fps, "from", peer);
+    setStatus("connecting", `Negociando con ${peer}`);
   });
 
-  await listen("mirror://packet", (e) => onPacket(e.payload));
+  await listen("mirror://signaling", (ev) => {
+    handleSignaling(ev.payload);
+  });
 })();

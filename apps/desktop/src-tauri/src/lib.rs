@@ -1,4 +1,3 @@
-use base64::Engine;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use once_cell::sync::OnceCell;
 use rand::Rng;
@@ -6,36 +5,33 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 // ---- Protocolo phone -> desktop ----
 //
-// Handshake v1 (legacy, sin PIN, 10 bytes):
-//   magic  : 4 bytes = b"MPH1"
-//   width  : 2 bytes BE u16
-//   height : 2 bytes BE u16
-//   fps    : 2 bytes BE u16
-//
-// Handshake v2 (con PIN, 16 bytes):
-//   magic  : 4 bytes = b"MPH2"
+// Handshake v2 (con PIN, 16 bytes) — usado tanto por MPH2 legacy como MPH3:
+//   magic  : 4 bytes = b"MPH2" (compat) o b"MPH3" (WebRTC signaling)
 //   pin    : 6 bytes ASCII
-//   width  : 2 bytes BE u16
-//   height : 2 bytes BE u16
-//   fps    : 2 bytes BE u16
+//   width  : 2 bytes BE u16 (informativo)
+//   height : 2 bytes BE u16 (informativo)
+//   fps    : 2 bytes BE u16 (informativo)
 //
-// Respuesta del servidor tras validar (solo v2):
+// Respuesta del servidor tras validar:
 //   1 byte: 0x00 = OK, 0x01 = PIN inválido
 //
-// Loop de paquetes (idéntico en ambas versiones):
-//   kind   : 1 byte  (0 = CSD/SPS+PPS, 1 = keyframe, 2 = delta)
-//   pts_us : 8 bytes BE u64
+// Después del ACK, canal de señalización WebRTC — frames tipo:
+//   kind   : 1 byte
+//              0x10 = SDP offer  (JSON)
+//              0x11 = SDP answer (JSON)
+//              0x12 = ICE candidate (JSON)
+//              0x13 = bye
 //   len    : 4 bytes BE u32
-//   data   : len bytes en formato Annex-B
+//   data   : len bytes UTF-8 JSON
 
 const SERVICE_TYPE: &str = "_mirrorphone._tcp.local.";
-const PROTO_VERSION: &str = "2";
+const PROTO_VERSION: &str = "3";
 
 #[derive(Serialize, Clone)]
 struct HandshakePayload {
@@ -46,10 +42,9 @@ struct HandshakePayload {
 }
 
 #[derive(Serialize, Clone)]
-struct PacketPayload {
+struct SignalingPayload {
     kind: u8,
-    pts_us: u64,
-    b64: String,
+    text: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -72,6 +67,8 @@ struct ServerState {
     pin: String,
     hostname: String,
     port: u16,
+    /// Sender activo del cliente conectado (para escribir signaling desde el frontend).
+    client_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
 static STATE: OnceCell<Arc<ServerState>> = OnceCell::new();
@@ -121,6 +118,23 @@ async fn get_pairing_info() -> Result<PairingInfo, String> {
     })
 }
 
+/// Envía un mensaje de signaling al cliente conectado (llamado por el frontend).
+#[tauri::command]
+async fn send_signaling(kind: u8, text: String) -> Result<(), String> {
+    let state = STATE.get().ok_or("no state")?;
+    let guard = state.client_tx.lock().await;
+    let tx = guard.as_ref().ok_or("no client connected")?;
+    let payload = text.into_bytes();
+    if payload.len() > 8 * 1024 * 1024 {
+        return Err("signaling payload too large".into());
+    }
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(kind);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    tx.send(frame).map_err(|e| e.to_string())
+}
+
 async fn start_server(app: AppHandle, port: u16) -> Result<(), String> {
     let state = STATE.get().ok_or("state uninitialized")?.clone();
     {
@@ -138,11 +152,11 @@ async fn start_server(app: AppHandle, port: u16) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((mut socket, peer)) => {
+                Ok((socket, peer)) => {
                     let app_h = app_handle.clone();
                     let peer_str = peer.to_string();
                     tauri::async_runtime::spawn(async move {
-                        match handle_client(&app_h, &mut socket, peer_str.clone()).await {
+                        match handle_client(&app_h, socket, peer_str.clone()).await {
                             Ok(()) => emit_status(
                                 &app_h,
                                 "disconnected",
@@ -153,6 +167,11 @@ async fn start_server(app: AppHandle, port: u16) -> Result<(), String> {
                                 "disconnected",
                                 &format!("Cerrado {}: {}", peer_str, e),
                             ),
+                        }
+                        // Limpieza: quitar el sender del state si aún era este cliente
+                        if let Some(state) = STATE.get() {
+                            let mut guard = state.client_tx.lock().await;
+                            *guard = None;
                         }
                     });
                 }
@@ -179,26 +198,27 @@ fn emit_status(app: &AppHandle, state: &str, message: &str) {
 
 async fn handle_client(
     app: &AppHandle,
-    socket: &mut tokio::net::TcpStream,
+    socket: tokio::net::TcpStream,
     peer: String,
 ) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
     socket.set_nodelay(true).ok();
 
+    let (mut rd, mut wr) = socket.into_split();
+
+    // Handshake
     let mut magic = [0u8; 4];
-    socket.read_exact(&mut magic).await?;
+    rd.read_exact(&mut magic).await?;
 
     let (width, height, fps);
-    if &magic == b"MPH2" {
+    if &magic == b"MPH3" || &magic == b"MPH2" {
         let mut buf = [0u8; 12];
-        socket.read_exact(&mut buf).await?;
+        rd.read_exact(&mut buf).await?;
         let received_pin: String = std::str::from_utf8(&buf[0..6])
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let expected_pin = STATE.get().map(|s| s.pin.clone()).unwrap_or_default();
         if received_pin != expected_pin {
-            let _ = socket.write_all(&[0x01u8]).await;
+            let _ = wr.write_all(&[0x01u8]).await;
             emit_status(
                 app,
                 "auth_failed",
@@ -209,17 +229,10 @@ async fn handle_client(
                 "bad pin",
             ));
         }
-        socket.write_all(&[0x00u8]).await?;
+        wr.write_all(&[0x00u8]).await?;
         width = u16::from_be_bytes([buf[6], buf[7]]);
         height = u16::from_be_bytes([buf[8], buf[9]]);
         fps = u16::from_be_bytes([buf[10], buf[11]]);
-    } else if &magic == b"MPH1" {
-        let mut buf = [0u8; 6];
-        socket.read_exact(&mut buf).await?;
-        width = u16::from_be_bytes([buf[0], buf[1]]);
-        height = u16::from_be_bytes([buf[2], buf[3]]);
-        fps = u16::from_be_bytes([buf[4], buf[5]]);
-        emit_status(app, "warning", "Cliente legacy MPH1 (sin PIN)");
     } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -238,33 +251,51 @@ async fn handle_client(
             width,
             height,
             fps,
-            peer,
+            peer: peer.clone(),
         },
     );
 
-    let engine = base64::engine::general_purpose::STANDARD;
-    loop {
-        let mut hdr = [0u8; 13];
-        socket.read_exact(&mut hdr).await?;
-        let kind = hdr[0];
-        let pts_us = u64::from_be_bytes([
-            hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7], hdr[8],
-        ]);
-        let len = u32::from_be_bytes([hdr[9], hdr[10], hdr[11], hdr[12]]) as usize;
-        if len == 0 || len > 8 * 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("bad packet size {}", len),
-            ));
-        }
-        let mut buf = vec![0u8; len];
-        socket.read_exact(&mut buf).await?;
-        let b64 = engine.encode(&buf);
-        let _ = app.emit(
-            "mirror://packet",
-            PacketPayload { kind, pts_us, b64 },
-        );
+    // Canal para escribir signaling desde el frontend
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    if let Some(state) = STATE.get() {
+        let mut guard = state.client_tx.lock().await;
+        *guard = Some(tx);
     }
+
+    // Task de escritura: consume mpsc → escribe al socket
+    let writer_task = tauri::async_runtime::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if wr.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Loop de lectura: signaling frames (1B kind + 4B len + payload)
+    let read_result: std::io::Result<()> = async {
+        loop {
+            let mut hdr = [0u8; 5];
+            rd.read_exact(&mut hdr).await?;
+            let kind = hdr[0];
+            let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+            if len > 8 * 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("bad signaling size {}", len),
+                ));
+            }
+            let mut buf = vec![0u8; len];
+            if len > 0 {
+                rd.read_exact(&mut buf).await?;
+            }
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            let _ = app.emit("mirror://signaling", SignalingPayload { kind, text });
+        }
+    }
+    .await;
+
+    writer_task.abort();
+    read_result
 }
 
 fn start_mdns(
@@ -307,13 +338,15 @@ pub fn run() {
         pin: pin.clone(),
         hostname: hostname.clone(),
         port,
+        client_tx: Mutex::new(None),
     }));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_local_ip,
-            get_pairing_info
+            get_pairing_info,
+            send_signaling
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -355,10 +388,4 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[tauri::command]
-#[allow(dead_code)]
-async fn restart_server(app: AppHandle, port: u16) -> Result<(), String> {
-    start_server(app, port).await
 }

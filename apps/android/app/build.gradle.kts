@@ -46,4 +46,7 @@ dependencies {
 
     // JSON
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    // WebRTC (Stream fork — mantenido, publicado en Maven Central, incluye ScreenCapturerAndroid)
+    implementation("io.getstream:stream-webrtc-android:1.3.4")
 }
