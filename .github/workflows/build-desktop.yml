@@ -102,13 +102,13 @@ jobs:
       - name: Gradle cache
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Build APK (release-unsigned)
-        run: ./gradlew assembleDebug
+      - name: Build APK (release, signed with debug key for distribution)
+        run: ./gradlew assembleRelease
 
       - name: Rename APK
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/debug/app-debug.apk out/MirrorPhoneAgent_${GITHUB_REF_NAME:-dev}.apk
+          cp app/build/outputs/apk/release/app-release.apk out/MirrorPhoneAgent_${GITHUB_REF_NAME:-dev}.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

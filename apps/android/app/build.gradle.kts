@@ -6,19 +6,38 @@ plugins {
 
 android {
     namespace = "com.mirrorphone.agent"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.mirrorphone.agent"
         minSdk = 24
-        targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        targetSdk = 35
+        versionCode = 2
+        versionName = "0.2.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    // Firma "debug" también para release para poder distribuir sin infra de firmas
+    signingConfigs {
+        getByName("debug") {
+            // keystore por defecto de Android — auto-generado
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // Empaqueta las .so con alineación de 16 KB (Android 15+)
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 
@@ -37,7 +56,7 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 
     // Camera + QR scanning
-    val camerax = "1.3.4"
+    val camerax = "1.4.1"
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
@@ -47,6 +66,6 @@ dependencies {
     // JSON
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
-    // WebRTC (Stream fork — mantenido, publicado en Maven Central, incluye ScreenCapturerAndroid)
-    implementation("io.getstream:stream-webrtc-android:1.3.4")
+    // WebRTC (Stream fork — última con soporte 16 KB page-size para Android 15)
+    implementation("io.getstream:stream-webrtc-android:1.3.8")
 }
