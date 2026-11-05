@@ -112,13 +112,8 @@ class MainActivity : AppCompatActivity(), ServerDiscovery.Listener {
         }
 
         binding.btnStop.setOnClickListener {
-            startService(Intent(this, CaptureService::class.java).apply {
-                action = CaptureService.ACTION_STOP
-            })
-            setStatus(getString(R.string.status_idle), active = false)
-            binding.btnStart.isEnabled = true
-            binding.btnStop.isEnabled = false
-            pendingServer = null
+            CaptureService.stopNow(this)
+            syncStreamingUi(false)
         }
 
         binding.manualHeader.setOnClickListener { toggleManual() }
@@ -128,11 +123,33 @@ class MainActivity : AppCompatActivity(), ServerDiscovery.Listener {
         super.onStart()
         discovery.start(this)
         binding.discoveryProgress.visibility = View.VISIBLE
+        CaptureService.stateListener = { active ->
+            runOnUiThread { syncStreamingUi(active) }
+        }
+        syncStreamingUi(CaptureService.isStreaming)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        syncStreamingUi(CaptureService.isStreaming)
     }
 
     override fun onStop() {
+        CaptureService.stateListener = null
         super.onStop()
         discovery.stop()
+    }
+
+    private fun syncStreamingUi(active: Boolean) {
+        binding.btnStart.isEnabled = !active
+        binding.btnStop.isEnabled = active
+        if (active) {
+            val target = pendingServer?.name ?: binding.inputIp.text?.toString().orEmpty()
+            val suffix = if (target.isNotBlank()) " → $target" else ""
+            setStatus("${getString(R.string.status_streaming)}$suffix", active = true)
+        } else {
+            setStatus(getString(R.string.status_idle), active = false)
+        }
     }
 
     override fun onServersChanged(list: List<Server>) {

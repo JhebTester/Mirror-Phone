@@ -4,32 +4,39 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
-import android.os.Handler
+import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
-import java.io.BufferedInputStream
-import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
-import org.webrtc.PeerConnection
 
 /**
- * Foreground service — Mirror Phone Agent (WebRTC edition):
- *  1. Conecta TCP al desktop y hace handshake MPH3 (con PIN).
- *  2. Después del ACK, el TCP se convierte en canal de signaling (SDP + ICE).
- *  3. Delega WebRTC a [WebRtcManager]; el video fluye P2P por UDP.
- *
- * Signaling frame:
- *   1 byte  kind: 0x10 offer | 0x11 answer | 0x12 ice | 0x13 bye
- *   4 bytes BE u32 len
- *   len bytes UTF-8 JSON
+ * Foreground service — Mirror Phone Agent (MPH4: UDP Zero-Buffer + TCP Control/PLI):
+ *  - Handshake y canal de control (PLI / CSD / BYE) por TCP con TCP_NODELAY.
+ *  - Video H.264 por UDP directo sin colas intermedias (latencia mínima).
+ *  - Recuperación instantánea ante pérdidas Wi-Fi mediante PLI (Picture Loss Indication)
+ *    que solicita un Keyframe (IDR) al encoder hardware en <16 ms.
  */
 class CaptureService : Service() {
 
@@ -48,21 +55,51 @@ class CaptureService : Service() {
         private const val REQ_STOP = 1
         private const val REQ_OPEN = 2
 
-        private const val KIND_OFFER: Byte = 0x10
-        private const val KIND_ANSWER: Byte = 0x11
-        private const val KIND_ICE: Byte = 0x12
-        private const val KIND_BYE: Byte = 0x13
-
         private const val TARGET_FPS = 60
+        private const val BITRATE = 5_000_000 // 5 Mbps VBR
+        private const val IFRAME_INTERVAL_SEC = 1
+        private const val MAX_UDP_PAYLOAD = 1360
+        private const val UDP_HEADER_SIZE = 20
+
+        private const val CMD_PLI = 0x01
+
+        @Volatile var isStreaming: Boolean = false
+            private set
+
+        @Volatile private var activeInstance: CaptureService? = null
+        @Volatile var stateListener: ((Boolean) -> Unit)? = null
+
+        fun stopNow(ctx: Context) {
+            isStreaming = false
+            stateListener?.invoke(false)
+            activeInstance?.fullStopAndExit()
+            try {
+                ctx.stopService(Intent(ctx, CaptureService::class.java))
+            } catch (_: Exception) {}
+        }
     }
 
-    private var socket: Socket? = null
-    private var dis: DataInputStream? = null
-    private var dos: DataOutputStream? = null
-    private var readerThread: Thread? = null
-    private var webrtc: WebRtcManager? = null
-    private val stopping = AtomicBoolean(false)
+    private var projection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var encoder: MediaCodec? = null
+    private var inputSurface: Surface? = null
+
+    @Volatile private var tcpSocket: Socket? = null
+    @Volatile private var tcpOut: DataOutputStream? = null
+    @Volatile private var udpSocket: DatagramSocket? = null
     @Volatile private var running = false
+    private val stopping = AtomicBoolean(false)
+    private val lastPliMs = AtomicLong(0L)
+
+    private var sessionThread: Thread? = null
+    private var drainThread: Thread? = null
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.i(TAG, "MediaProjection stopped by system")
+            fullStopAndExit()
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -76,8 +113,15 @@ class CaptureService : Service() {
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 7878)
                 val pin = intent.getStringExtra(EXTRA_PIN) ?: ""
-                if (data == null || code != Activity.RESULT_OK) { stopSelf(); return START_NOT_STICKY }
-                startForegroundWithType("Iniciando conexión a $host:$port…")
+                if (data == null || code != Activity.RESULT_OK) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                stopping.set(false)
+                activeInstance = this
+                isStreaming = true
+                runOnMainSafe { stateListener?.invoke(true) }
+                startForegroundWithType("Conectando a $host:$port…")
                 startMirror(code, data, host, port, pin)
             }
             ACTION_STOP -> {
@@ -160,148 +204,286 @@ class CaptureService : Service() {
     // ----------------------------------------------------------------- start
 
     private fun startMirror(code: Int, data: Intent, host: String, port: Int, pin: String) {
-        val (srcW, srcH) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projection = mgr.getMediaProjection(code, data)
+        if (projection == null) {
+            Log.e(TAG, "Failed to obtain MediaProjection")
+            fullStopAndExit()
+            return
+        }
+        projection!!.registerCallback(projectionCallback, null)
+
+        val (srcW, srcH, dpi) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
             val b = wm.currentWindowMetrics.bounds
-            b.width() to b.height()
+            Triple(b.width(), b.height(), resources.displayMetrics.densityDpi)
         } else {
             val m = DisplayMetrics()
             @Suppress("DEPRECATION")
             (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(m)
-            m.widthPixels to m.heightPixels
+            Triple(m.widthPixels, m.heightPixels, m.densityDpi)
         }
+
         val maxSide = 1280
         val scale = minOf(1f, maxSide.toFloat() / maxOf(srcW, srcH).toFloat())
         val w = (((srcW * scale).toInt() + 15) / 16) * 16
         val h = (((srcH * scale).toInt() + 15) / 16) * 16
-        Log.i(TAG, "screen ${srcW}x${srcH} -> WebRTC ${w}x${h} @ ${TARGET_FPS}fps -> $host:$port")
 
         running = true
 
-        // Reader/handshake thread: conecta TCP, autentica, arranca WebRTC, lee signaling
-        readerThread = thread(name = "mph-signaling", isDaemon = true) {
+        sessionThread = thread(name = "mph-session", isDaemon = true) {
             try {
+                // 1) Conectar canal de control TCP y validar PIN
                 val s = Socket()
                 s.connect(InetSocketAddress(host, port), 5000)
                 s.tcpNoDelay = true
                 s.setSoLinger(true, 1)
-                socket = s
-                dos = DataOutputStream(s.getOutputStream().buffered(16 * 1024))
-                dis = DataInputStream(BufferedInputStream(s.getInputStream(), 16 * 1024))
+                tcpSocket = s
 
-                // Handshake MPH3 (mismo layout que MPH2 pero cambia magic)
-                if (pin.length != 6) {
-                    Log.e(TAG, "PIN requerido para MPH3 (recibido: '$pin')")
-                    updateNotification("PIN inválido")
-                    fullStopAndExit(); return@thread
-                }
-                dos!!.write("MPH3".toByteArray(Charsets.US_ASCII))
-                val pinBytes = pin.uppercase().padEnd(6, ' ').substring(0, 6)
-                    .toByteArray(Charsets.US_ASCII)
-                dos!!.write(pinBytes)
-                dos!!.writeShort(w)
-                dos!!.writeShort(h)
-                dos!!.writeShort(TARGET_FPS)
-                dos!!.flush()
-                val ack = dis!!.read()
+                val dos = DataOutputStream(s.getOutputStream().buffered(8 * 1024))
+                val ins = s.getInputStream()
+                tcpOut = dos
+
+                val cleanPin = pin.uppercase().padEnd(6, ' ').substring(0, 6)
+                dos.write("MPH4".toByteArray(Charsets.US_ASCII))
+                dos.write(cleanPin.toByteArray(Charsets.US_ASCII))
+                dos.writeShort(w)
+                dos.writeShort(h)
+                dos.writeShort(TARGET_FPS)
+                dos.flush()
+
+                val ack = ins.read()
                 if (ack != 0) {
-                    Log.e(TAG, "Servidor rechazó el PIN (ack=$ack)")
-                    updateNotification("PIN inválido — detenido")
-                    fullStopAndExit(); return@thread
+                    Log.e(TAG, "PIN rechazado por el servidor (ack=$ack)")
+                    runOnMainSafe { updateNotification("PIN inválido — detenido") }
+                    fullStopAndExit()
+                    return@thread
                 }
-                Log.i(TAG, "Handshake MPH3 OK, iniciando WebRTC…")
-                updateNotification("Negociando WebRTC…")
 
-                // Iniciar WebRTC (offerer)
-                val transport = object : WebRtcManager.SignalingTransport {
-                    override fun sendOffer(sdp: String) {
-                        val json = org.json.JSONObject().put("sdp", sdp).toString()
-                        writeFrame(KIND_OFFER, json.toByteArray(Charsets.UTF_8))
-                    }
-                    override fun sendIce(candidateJson: String) {
-                        writeFrame(KIND_ICE, candidateJson.toByteArray(Charsets.UTF_8))
-                    }
-                    override fun onConnectionState(state: PeerConnection.PeerConnectionState) {
-                        when (state) {
-                            PeerConnection.PeerConnectionState.CONNECTED ->
-                                updateNotification("Espejando (WebRTC conectado)")
-                            PeerConnection.PeerConnectionState.FAILED,
-                            PeerConnection.PeerConnectionState.DISCONNECTED -> {
-                                updateNotification("Conexión perdida — detenido")
-                                fullStopAndExit()
-                            }
-                            else -> {}
-                        }
-                    }
-                    override fun onError(msg: String) {
-                        Log.e(TAG, "WebRTC error: $msg")
-                        updateNotification("Error WebRTC: $msg")
-                    }
+                // 2) Preparar socket UDP de baja latencia
+                val targetAddr = InetAddress.getByName(host)
+                val udp = DatagramSocket().apply {
+                    try { sendBufferSize = 512 * 1024 } catch (_: Exception) {}
+                    // IPTOS_LOWDELAY (0x10) | DSCP CS4 (0x80) para priorizar en Wi-Fi WMM
+                    try { trafficClass = 0x90 } catch (_: Exception) {}
                 }
-                webrtc = WebRtcManager(
-                    applicationContext,
-                    data,
-                    w, h, TARGET_FPS,
-                    transport
-                ).also { it.start() }
+                udpSocket = udp
 
-                // Loop de lectura de signaling desde el desktop
+                // 3) Iniciar MediaCodec H.264 directo desde VirtualDisplay
+                startEncoderAndDrain(w, h, dpi, targetAddr, port)
+                runOnMainSafe { updateNotification("Espejando a $host:$port (UDP Zero-Buffer)") }
+
+                // 4) Bucle lector de control TCP: recibe PLI (0x01) desde Desktop
                 while (running) {
-                    val kind = dis!!.read()
-                    if (kind < 0) break // EOF
-                    val len = dis!!.readInt()
-                    if (len < 0 || len > 8 * 1024 * 1024) {
-                        Log.e(TAG, "bad signaling size $len")
-                        break
-                    }
-                    val payload = ByteArray(len)
-                    dis!!.readFully(payload)
-                    val text = String(payload, Charsets.UTF_8)
-                    when (kind.toByte()) {
-                        KIND_ANSWER -> {
-                            val sdp = org.json.JSONObject(text).getString("sdp")
-                            webrtc?.onAnswer(sdp)
-                        }
-                        KIND_ICE -> {
-                            webrtc?.onRemoteIce(text)
-                        }
-                        KIND_BYE -> {
-                            Log.i(TAG, "BYE recibido")
-                            break
-                        }
-                        else -> Log.w(TAG, "kind desconocido: $kind")
+                    val cmd = ins.read()
+                    if (cmd < 0) break // EOF: desktop cerró
+                    if (cmd == CMD_PLI) {
+                        requestSyncFrameThrottled()
                     }
                 }
-                Log.i(TAG, "reader loop terminó")
                 if (running) fullStopAndExit()
             } catch (e: Exception) {
                 if (running) {
-                    Log.e(TAG, "reader error: ${e.message}", e)
-                    updateNotification("Conexión perdida — detenido")
+                    Log.e(TAG, "Session error: ${e.message}", e)
+                    runOnMainSafe { updateNotification("Conexión perdida — detenido") }
                     fullStopAndExit()
                 }
             }
         }
     }
 
-    private fun writeFrame(kind: Byte, payload: ByteArray) {
-        try {
-            val out = dos ?: return
-            synchronized(out) {
-                out.writeByte(kind.toInt())
-                out.writeInt(payload.size)
-                out.write(payload)
-                out.flush()
+    private fun startEncoderAndDrain(
+        w: Int,
+        h: Int,
+        dpi: Int,
+        targetAddr: InetAddress,
+        port: Int
+    ) {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
+            setInteger(MediaFormat.KEY_FRAME_RATE, TARGET_FPS)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, IFRAME_INTERVAL_SEC)
+            setInteger(
+                MediaFormat.KEY_BITRATE_MODE,
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            )
+            // Repite el cuadro anterior tras 100 ms de pantalla estática para que el
+            // decoder nunca retenga el último frame al cambiar de app o dejar de tocar.
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+            if (Build.VERSION.SDK_INT >= 21) {
+                setInteger(
+                    MediaFormat.KEY_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+                )
+                setInteger(
+                    MediaFormat.KEY_LEVEL,
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel41
+                )
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "writeFrame failed: ${e.message}")
+            if (Build.VERSION.SDK_INT >= 29) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
         }
+
+        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            inputSurface = createInputSurface()
+            start()
+        }
+
+        virtualDisplay = projection!!.createVirtualDisplay(
+            "MirrorPhone",
+            w, h, dpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            inputSurface, null, null
+        )
+
+        drainThread = thread(name = "mph-drain-udp", isDaemon = true) {
+            val info = MediaCodec.BufferInfo()
+            val pktBuf = ByteArray(UDP_HEADER_SIZE + MAX_UDP_PAYLOAD)
+            var csd: ByteArray? = null
+            var frameSeq = 1
+
+            while (running) {
+                val idx = try {
+                    encoder?.dequeueOutputBuffer(info, 10_000) ?: break
+                } catch (e: Exception) {
+                    if (running) Log.e(TAG, "dequeue error", e)
+                    break
+                }
+                if (idx < 0) continue
+
+                val buf: ByteBuffer = try {
+                    encoder?.getOutputBuffer(idx) ?: continue
+                } catch (_: Exception) {
+                    continue
+                }
+                buf.position(info.offset)
+                buf.limit(info.offset + info.size)
+                val bytes = ByteArray(info.size).also { buf.get(it) }
+                try {
+                    encoder?.releaseOutputBuffer(idx, false)
+                } catch (_: Exception) {}
+
+                val isCfg = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                if (isCfg) {
+                    csd = bytes
+                    // Enviamos CSD tanto por TCP (100% fiable) como por UDP (inmediato)
+                    sendTcpPacket(0, info.presentationTimeUs, bytes)
+                    sendUdpFrame(0, 0, info.presentationTimeUs, bytes, pktBuf, targetAddr, port)
+                } else {
+                    val seq = frameSeq++
+                    if (isKey && csd != null) {
+                        sendUdpFrame(0, 0, info.presentationTimeUs, csd!!, pktBuf, targetAddr, port)
+                    }
+                    val kind: Byte = if (isKey) 1 else 2
+                    sendUdpFrame(kind, seq, info.presentationTimeUs, bytes, pktBuf, targetAddr, port)
+                }
+
+                if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+            }
+            Log.i(TAG, "Drain UDP loop terminó")
+        }
+    }
+
+    private fun sendUdpFrame(
+        kind: Byte,
+        frameId: Int,
+        ptsUs: Long,
+        data: ByteArray,
+        pktBuf: ByteArray,
+        addr: InetAddress,
+        port: Int
+    ) {
+        val udp = udpSocket ?: return
+        val total = data.size
+        if (total == 0) return
+        val fragCount = (total + MAX_UDP_PAYLOAD - 1) / MAX_UDP_PAYLOAD
+
+        var offset = 0
+        var fragIdx = 0
+        while (offset < total && running) {
+            val chunkLen = minOf(MAX_UDP_PAYLOAD, total - offset)
+
+            // Header 20 bytes
+            pktBuf[0] = 'M'.code.toByte()
+            pktBuf[1] = 'P'.code.toByte()
+            pktBuf[2] = kind
+            pktBuf[3] = 0
+            // frame_id (u32 BE)
+            pktBuf[4] = (frameId ushr 24).toByte()
+            pktBuf[5] = (frameId ushr 16).toByte()
+            pktBuf[6] = (frameId ushr 8).toByte()
+            pktBuf[7] = frameId.toByte()
+            // frag_idx (u16 BE)
+            pktBuf[8] = (fragIdx ushr 8).toByte()
+            pktBuf[9] = fragIdx.toByte()
+            // frag_count (u16 BE)
+            pktBuf[10] = (fragCount ushr 8).toByte()
+            pktBuf[11] = fragCount.toByte()
+            // pts_us (u64 BE)
+            pktBuf[12] = (ptsUs ushr 56).toByte()
+            pktBuf[13] = (ptsUs ushr 48).toByte()
+            pktBuf[14] = (ptsUs ushr 40).toByte()
+            pktBuf[15] = (ptsUs ushr 32).toByte()
+            pktBuf[16] = (ptsUs ushr 24).toByte()
+            pktBuf[17] = (ptsUs ushr 16).toByte()
+            pktBuf[18] = (ptsUs ushr 8).toByte()
+            pktBuf[19] = ptsUs.toByte()
+
+            System.arraycopy(data, offset, pktBuf, UDP_HEADER_SIZE, chunkLen)
+
+            try {
+                val dp = DatagramPacket(pktBuf, UDP_HEADER_SIZE + chunkLen, addr, port)
+                udp.send(dp)
+            } catch (_: Exception) {
+                return
+            }
+
+            offset += chunkLen
+            fragIdx++
+        }
+    }
+
+    private fun sendTcpPacket(kind: Byte, ptsUs: Long, data: ByteArray) {
+        val dos = tcpOut ?: return
+        try {
+            synchronized(dos) {
+                dos.writeByte(kind.toInt())
+                dos.writeLong(ptsUs)
+                dos.writeInt(data.size)
+                dos.write(data)
+                dos.flush()
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun requestSyncFrameThrottled() {
+        val now = SystemClock.elapsedRealtime()
+        val prev = lastPliMs.get()
+        if (now - prev < 40) return
+        if (!lastPliMs.compareAndSet(prev, now)) return
+        try {
+            val params = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            encoder?.setParameters(params)
+        } catch (_: Exception) {}
     }
 
     // ------------------------------------------------------------------ stop
 
-    private fun fullStopAndExit() {
+    fun fullStopAndExit() {
         if (!stopping.compareAndSet(false, true)) return
+        isStreaming = false
+        if (activeInstance === this) activeInstance = null
+        runOnMainSafe { stateListener?.invoke(false) }
         stopMirror()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -311,17 +493,53 @@ class CaptureService : Service() {
                 stopForeground(true)
             }
         } catch (_: Exception) {}
+        try {
+            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            mgr.cancel(NOTIF_ID)
+        } catch (_: Exception) {}
         stopSelf()
     }
 
     private fun stopMirror() {
         running = false
-        try { webrtc?.stop() } catch (_: Exception) {}
-        webrtc = null
-        try { socket?.close() } catch (_: Exception) {}
-        socket = null
-        try { readerThread?.interrupt() } catch (_: Exception) {}
-        dis = null
-        dos = null
+        val u = udpSocket
+        val t = tcpSocket
+        udpSocket = null
+        tcpSocket = null
+        tcpOut = null
+
+        val sThread = sessionThread
+        val dThread = drainThread
+        sessionThread = null
+        drainThread = null
+
+        val enc = encoder
+        val vd = virtualDisplay
+        val surf = inputSurface
+        val proj = projection
+        encoder = null
+        virtualDisplay = null
+        inputSurface = null
+        projection = null
+
+        // Liberar sockets y codecs fuera del hilo principal para evitar NetworkOnMainThreadException o bloqueos
+        thread(name = "mph-cleanup", isDaemon = true) {
+            try { u?.close() } catch (_: Exception) {}
+            try { t?.close() } catch (_: Exception) {}
+            try { sThread?.interrupt() } catch (_: Exception) {}
+            try { dThread?.interrupt() } catch (_: Exception) {}
+            try { vd?.release() } catch (_: Exception) {}
+            try { enc?.stop() } catch (_: Exception) {}
+            try { enc?.release() } catch (_: Exception) {}
+            try { surf?.release() } catch (_: Exception) {}
+            try { proj?.unregisterCallback(projectionCallback) } catch (_: Exception) {}
+            try { proj?.stop() } catch (_: Exception) {}
+        }
+    }
+
+    private fun runOnMainSafe(block: () -> Unit) {
+        try {
+            android.os.Handler(mainLooper).post(block)
+        } catch (_: Exception) {}
     }
 }

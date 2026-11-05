@@ -12,8 +12,8 @@ android {
         applicationId = "com.mirrorphone.agent"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -65,7 +65,4 @@ dependencies {
 
     // JSON
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
-
-    // WebRTC (Stream fork — última con soporte 16 KB page-size para Android 15)
-    implementation("io.getstream:stream-webrtc-android:1.3.8")
 }
