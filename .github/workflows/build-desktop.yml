@@ -96,11 +96,15 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        run: |
+          SDK_MGR="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | sort -V | tail -1)"
+          if [ -n "$SDK_MGR" ]; then
+            yes | "$SDK_MGR" --licenses > /dev/null || true
+          fi
 
       - name: Gradle cache
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK (release, signed with debug key for distribution)
         run: ./gradlew assembleRelease
